@@ -2,6 +2,9 @@
 name = "zoho-clicker"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Simple CLI tool for automating Zoho People check-in/check-out"
+repository = "https://github.com/xelth-com/zoho-clicker"
 
 [dependencies]
 thirtyfour = "0.35"
