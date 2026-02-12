@@ -1,3 +1,6 @@
+// Hide console window on Windows (logs go to zoho-clicker.log)
+#![windows_subsystem = "windows"]
+
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveTime, Weekday};
 use log::{error, info, warn};
@@ -17,13 +20,20 @@ const LOGIN_URL: &str = "https://accounts.zoho.eu/signin?servicename=zohopeople"
 const PEOPLE_URL: &str =
     "https://people.zoho.eu/20086748177/zp#home/myspace/overview-actionlist";
 
-const PAGE_LOAD_WAIT: Duration = Duration::from_secs(8);
-const SHORT_WAIT: Duration = Duration::from_secs(3);
+const PAGE_LOAD_WAIT: Duration = Duration::from_secs(10);
+const SHORT_WAIT: Duration = Duration::from_secs(4);
 const POST_CLICK_WAIT: Duration = Duration::from_secs(5);
 const LOOP_SLEEP: Duration = Duration::from_secs(60);          // 1 min between checks
 const CHECKIN_RETRY_SLEEP: Duration = Duration::from_secs(600); // 10 min retry
 const WEEKEND_SLEEP: Duration = Duration::from_secs(3600);     // 1 hour on weekends
 const WARNING_WAIT: Duration = Duration::from_secs(60);        // 1 min after popup
+
+/// What action the daemon wants to perform.
+#[derive(Clone, Copy, PartialEq)]
+enum Action {
+    CheckIn,
+    CheckOut,
+}
 
 // ── State file ──
 #[derive(Serialize, Deserialize, Default)]
@@ -46,6 +56,10 @@ fn exe_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn chrome_profile_dir() -> PathBuf {
+    exe_dir().join("chrome-profile")
 }
 
 fn state_path() -> PathBuf {
@@ -74,7 +88,6 @@ fn today_str() -> String {
 }
 
 fn load_config() -> Result<Config> {
-    // Try loading config.env from exe directory, then current dir
     let env_path = exe_dir().join("config.env");
     if env_path.exists() {
         dotenvy::from_path(&env_path).ok();
@@ -143,7 +156,6 @@ fn show_warning_popup() {
     let msg = w!("Check-in \u{0447}\u{0435}\u{0440}\u{0435}\u{0437} 1 \u{043c}\u{0438}\u{043d}\u{0443}\u{0442}\u{0443}!\n\n\u{041d}\u{0430}\u{0436}\u{043c}\u{0438}\u{0442}\u{0435} OK \u{0438}\u{043b}\u{0438} \u{043f}\u{043e}\u{0434}\u{043e}\u{0436}\u{0434}\u{0438}\u{0442}\u{0435}.");
 
     unsafe {
-        // MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL
         let _ = MessageBoxW(None, msg, title, MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL);
     }
 }
@@ -153,22 +165,19 @@ fn show_warning_popup() {
     info!("(popup not available on this platform)");
 }
 
-/// Try to find and start chromedriver.exe if not already running.
+/// Start chromedriver.exe if not already running.
 fn ensure_chromedriver() -> Option<Child> {
-    // Check if already running by trying to connect
     if std::net::TcpStream::connect("127.0.0.1:9515").is_ok() {
         info!("ChromeDriver already running on port 9515");
         return None;
     }
 
-    // Look for chromedriver next to our exe
     let driver_path = exe_dir().join("chromedriver.exe");
     if !driver_path.exists() {
         warn!(
             "chromedriver.exe not found at {}. Trying PATH...",
             driver_path.display()
         );
-        // Try from PATH
         match Command::new("chromedriver")
             .arg("--port=9515")
             .stdout(std::process::Stdio::null())
@@ -203,12 +212,17 @@ fn ensure_chromedriver() -> Option<Child> {
     }
 }
 
-/// Perform the Zoho login + check-in or check-out.
-/// Returns the button text that was clicked (e.g. "Check-in" or "Check-out").
-async fn zoho_action(config: &Config) -> Result<String> {
+/// Log in to Zoho, navigate to People, and perform the requested action.
+/// Returns Ok(true) if the action was performed, Ok(false) if the button
+/// was already in the desired state (nothing to do).
+async fn zoho_action(config: &Config, action: Action) -> Result<bool> {
     let mut caps = DesiredCapabilities::chrome();
     caps.add_arg("--disable-infobars")?;
-    caps.add_arg("--headless=new")?;   // run in background, no visible window
+    // Dedicated profile directory — avoids Chrome's profile picker dialog
+    let profile_dir = chrome_profile_dir();
+    caps.add_arg(&format!("--user-data-dir={}", profile_dir.display()))?;
+    caps.add_arg("--window-size=1280,900")?;
+    caps.add_arg("--window-position=-2000,0")?; // off-screen
     caps.add_exclude_switch("enable-automation")?;
 
     info!("Connecting to ChromeDriver ...");
@@ -216,15 +230,23 @@ async fn zoho_action(config: &Config) -> Result<String> {
         .await
         .context("Failed to connect to ChromeDriver on port 9515")?;
 
-    let result = do_zoho_action(&driver, config).await;
+    let result = do_zoho_action(&driver, config, action).await;
 
-    // Always try to quit the browser session
     let _ = driver.quit().await;
 
     result
 }
 
-async fn do_zoho_action(driver: &WebDriver, config: &Config) -> Result<String> {
+async fn do_zoho_action(
+    driver: &WebDriver,
+    config: &Config,
+    action: Action,
+) -> Result<bool> {
+    let action_name = match action {
+        Action::CheckIn => "Check-in",
+        Action::CheckOut => "Check-out",
+    };
+
     // ── Login ──
     info!("Navigating to Zoho login ...");
     driver.goto(LOGIN_URL).await?;
@@ -239,25 +261,17 @@ async fn do_zoho_action(driver: &WebDriver, config: &Config) -> Result<String> {
     email_input.clear().await?;
     email_input.send_keys(&config.email).await?;
 
-    driver
-        .find(By::Id("nextbtn"))
-        .await?
-        .click()
-        .await?;
+    driver.find(By::Id("nextbtn")).await?.click().await?;
     sleep(SHORT_WAIT).await;
 
     // Password
     info!("Entering password ...");
-    let pass_input = wait_for_element(driver, By::Id("password"), 10).await
+    let pass_input = wait_for_element(driver, By::Id("password"), 15).await
         .context("Could not find #password")?;
     pass_input.clear().await?;
     pass_input.send_keys(&config.password).await?;
 
-    driver
-        .find(By::Id("nextbtn"))
-        .await?
-        .click()
-        .await?;
+    driver.find(By::Id("nextbtn")).await?.click().await?;
 
     info!("Waiting for login ...");
     sleep(PAGE_LOAD_WAIT).await;
@@ -272,13 +286,27 @@ async fn do_zoho_action(driver: &WebDriver, config: &Config) -> Result<String> {
 
     // ── Find button ──
     info!("Waiting for attendance button ...");
-    let button = wait_for_element(driver, By::Id("ZPAtt_check_in_out"), 30).await
+    let button = wait_for_element(driver, By::Id("ZPAtt_check_in_out"), 60).await
         .context("Could not find #ZPAtt_check_in_out")?;
 
     let status = get_status(driver).await;
     let btn_text = button.text().await.unwrap_or_default();
 
     info!("Status: {:?}, Button: {:?}", status, btn_text);
+
+    // ── Check if button matches desired action ──
+    let btn_matches = match action {
+        Action::CheckIn => btn_text.contains("Check-in"),
+        Action::CheckOut => btn_text.contains("Check-out"),
+    };
+
+    if !btn_matches {
+        info!(
+            "Button shows '{}' but we want '{}' — already in desired state, skipping.",
+            btn_text, action_name
+        );
+        return Ok(false);
+    }
 
     // ── Click ──
     info!("Clicking '{}' ...", btn_text);
@@ -297,7 +325,7 @@ async fn do_zoho_action(driver: &WebDriver, config: &Config) -> Result<String> {
         status_after, btn_after
     );
 
-    Ok(btn_text)
+    Ok(true)
 }
 
 async fn get_status(driver: &WebDriver) -> String {
@@ -342,8 +370,7 @@ async fn main() -> Result<()> {
     );
 
     // Start chromedriver if needed
-    let mut _chromedriver_child = ensure_chromedriver();
-    // Give it a moment to start
+    let _chromedriver_child = ensure_chromedriver();
     sleep(Duration::from_secs(2)).await;
 
     loop {
@@ -365,19 +392,21 @@ async fn main() -> Result<()> {
         let already_checked_in = state
             .last_checkin
             .as_deref()
-            .map(|d| d == today)
-            .unwrap_or(false);
+            .is_some_and(|d| d == today);
 
         if time >= config.checkin_start && time < config.checkin_end && !already_checked_in {
             info!("Check-in window active. Showing warning popup ...");
-            // Show popup in a separate thread (blocking call)
             std::thread::spawn(show_warning_popup);
             sleep(WARNING_WAIT).await;
 
             info!("Attempting check-in ...");
-            match zoho_action(&config).await {
-                Ok(btn_text) => {
-                    info!("Check-in action completed (clicked '{}')", btn_text);
+            match zoho_action(&config, Action::CheckIn).await {
+                Ok(clicked) => {
+                    if clicked {
+                        info!("Check-in successful!");
+                    } else {
+                        info!("Already checked in (button was Check-out).");
+                    }
                     let mut state = load_state();
                     state.last_checkin = Some(today.clone());
                     save_state(&state);
@@ -394,23 +423,23 @@ async fn main() -> Result<()> {
         let already_checked_out = state
             .last_checkout
             .as_deref()
-            .map(|d| d == today)
-            .unwrap_or(false);
+            .is_some_and(|d| d == today);
 
         if time >= config.checkout_after && !already_checked_out {
             info!("Check-out time. No warning, proceeding ...");
-            match zoho_action(&config).await {
-                Ok(btn_text) => {
-                    info!("Check-out action completed (clicked '{}')", btn_text);
-                    let mut state = load_state();
-                    state.last_checkout = Some(today.clone());
-                    save_state(&state);
+            match zoho_action(&config, Action::CheckOut).await {
+                Ok(clicked) => {
+                    if clicked {
+                        info!("Check-out successful!");
+                    } else {
+                        info!("Not checked in today — nothing to check out.");
+                    }
                 }
                 Err(e) => {
                     error!("Check-out failed: {:#}", e);
                 }
             }
-            // Don't retry today even on failure — avoid hammering
+            // Mark as done regardless — don't retry
             let mut state = load_state();
             state.last_checkout = Some(today.clone());
             save_state(&state);
