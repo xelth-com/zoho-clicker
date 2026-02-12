@@ -2,3 +2,6 @@
 config.env
 state.json
 *.log
+
+# Added by eck-snapshot to ignore metadata directory
+.eck/
