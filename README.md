@@ -1,39 +1,52 @@
 # zoho-clicker
 
-Simple Rust CLI tool for automating the check-in/check-out button on [Zoho People](https://people.zoho.eu/) attendance page.
+Background daemon that automatically checks in/out on [Zoho People](https://people.zoho.eu/) attendance page.
 
-Built with [thirtyfour](https://crates.io/crates/thirtyfour) (Selenium WebDriver client for Rust).
+Runs as a background process on Windows. Checks in during the morning window and checks out in the evening, skipping weekends.
 
-## Prerequisites
+## How it works
 
-- **Rust** 1.70+
-- **ChromeDriver** matching your Chrome version — download from [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/)
+- **08:50–10:00 (weekdays):** Shows a warning popup, waits 1 minute, then performs check-in
+- **After 18:00 (weekdays):** Silently performs check-out
+- **Weekends:** Sleeps, does nothing
+- Tracks state in `state.json` — won't retry if already done today
+- Logs everything to `zoho-clicker.log`
 
-## Usage
+## Setup
 
-1. **Close all Chrome windows** (needed to reuse your profile with saved Zoho session).
+1. **Download ChromeDriver** matching your Chrome version from [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/)
 
-2. **Start ChromeDriver:**
+2. **Place these files together:**
    ```
-   chromedriver.exe --port=9515
+   zoho-clicker.exe
+   chromedriver.exe
+   config.env
    ```
 
-3. **Run:**
+3. **Edit `config.env`:**
    ```
-   cargo run
+   ZOHO_EMAIL=your@email.com
+   ZOHO_PASSWORD=yourpassword
+   CHECKIN_START=08:50
+   CHECKIN_END=10:00
+   CHECKOUT_AFTER=18:00
    ```
 
-The tool will:
-- Open Chrome with your existing profile (so Zoho cookies are preserved)
-- Navigate to the Zoho People attendance page
-- Find the check-in/check-out button
-- Print button state **before** clicking
-- Click the button
-- Print button state **after** clicking and compare
+4. **Run** `zoho-clicker.exe`
 
-## Configuration
+## Auto-start with Windows
 
-Edit the CSS selectors in `src/main.rs` → `selectors` array to match your Zoho People page if the defaults don't work.
+Add a shortcut to `zoho-clicker.exe` in your Startup folder:
+- Press `Win+R`, type `shell:startup`, press Enter
+- Create a shortcut to `zoho-clicker.exe` there
+
+## Build from source
+
+```
+cargo build --release
+```
+
+Output: `target/release/zoho-clicker.exe` (~4.5 MB)
 
 ## License
 
