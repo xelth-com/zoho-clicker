@@ -3,28 +3,21 @@ use std::time::Duration;
 use thirtyfour::prelude::*;
 use tokio::time::sleep;
 
-const ZOHO_URL: &str =
-    "https://people.zoho.eu/20086748177/zp#home/myspace/overview-actionlist";
+// ── Configuration ──
+const EMAIL: &str = "d.suro@inbody.com";
+const PASSWORD: &str = "dima13.,Dima241";
 
-/// How long to wait for the page / SPA to finish rendering.
+const LOGIN_URL: &str = "https://accounts.zoho.eu/signin?servicename=zohopeople";
+const PEOPLE_URL: &str = "https://people.zoho.eu/20086748177/zp#home/myspace/overview-actionlist";
+
 const PAGE_LOAD_WAIT: Duration = Duration::from_secs(8);
-/// How long to wait after clicking the button.
-const POST_CLICK_WAIT: Duration = Duration::from_secs(4);
+const SHORT_WAIT: Duration = Duration::from_secs(3);
+const POST_CLICK_WAIT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ── 1. Connect to ChromeDriver with existing user profile ──
+    // ── 1. Connect to ChromeDriver ──
     let mut caps = DesiredCapabilities::chrome();
-
-    // Reuse existing Chrome profile so Zoho session cookies are available.
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "Dmytro".into());
-    let user_data_dir = format!(
-        r"C:\Users\{}\AppData\Local\Google\Chrome\User Data",
-        user
-    );
-    caps.add_arg(&format!("--user-data-dir={}", user_data_dir))?;
-    caps.add_arg("--profile-directory=Default")?;
-    // Disable "Chrome is being controlled by automated software" bar.
     caps.add_arg("--disable-infobars")?;
     caps.add_exclude_switch("enable-automation")?;
 
@@ -34,83 +27,106 @@ async fn main() -> Result<()> {
         .context(
             "Failed to connect to ChromeDriver.\n\
              Make sure chromedriver.exe is running:\n  \
-             chromedriver.exe --port=9515\n\
-             Also close ALL existing Chrome windows first \
-             (profile lock).",
+             chromedriver.exe --port=9515",
         )?;
 
-    // ── 2. Navigate to Zoho People ──
-    println!("[*] Navigating to Zoho People ...");
-    driver.goto(ZOHO_URL).await?;
+    // ── 2. Login to Zoho ──
+    println!("[*] Navigating to Zoho login ...");
+    driver.goto(LOGIN_URL).await?;
     sleep(PAGE_LOAD_WAIT).await;
 
-    // ── 3. Find the check-in / check-out button ──
-    //
-    // Zoho People attendance widget – common selectors (may need tweaking):
-    //   - The main punch/check-in button
-    //   - Usually inside a widget with class containing "attendance" or "checkin"
-    //
-    // We try several selectors from most to least specific.
-    let selectors = [
-        // Zoho People attendance punch button (common)
-        r#"button.punchbutton"#,
-        r#".att-punch-btn"#,
-        r#".checkin-checkout-btn"#,
-        r#"[data-lc="checkin"]"#,
-        r#"[data-lc="checkout"]"#,
-        r#".ztm-punch-btn"#,
-        // Generic fallback: a prominent action button inside the overview
-        r#".overview-actionlist button"#,
-        r#".zp_action_btn"#,
-    ];
+    // Step 1: Enter email
+    println!("[*] Entering email ...");
+    let email_input = driver
+        .find(By::Id("login_id"))
+        .await
+        .context("Could not find email input #login_id")?;
+    email_input.clear().await?;
+    email_input.send_keys(EMAIL).await?;
 
-    let button = find_first_match(&driver, &selectors).await.context(
-        "Could not find the check-in/check-out button.\n\
-         Run with --inspect to see page elements, \
-         then update the `selectors` list in main.rs.",
-    )?;
+    // Click "Weiter" (Next)
+    let next_btn = driver
+        .find(By::Id("nextbtn"))
+        .await
+        .context("Could not find #nextbtn")?;
+    next_btn.click().await?;
+    sleep(SHORT_WAIT).await;
 
-    // ── 4. State BEFORE click ──
-    let text_before = button.text().await.unwrap_or_default();
-    let class_before = button
-        .attr("class")
+    // Step 2: Enter password
+    println!("[*] Entering password ...");
+    let pass_input = wait_for_element(&driver, By::Id("password"), 10).await
+        .context("Could not find password input #password")?;
+    pass_input.clear().await?;
+    pass_input.send_keys(PASSWORD).await?;
+
+    // Click "Anmelden" (Sign in) — same #nextbtn id
+    let sign_in_btn = driver
+        .find(By::Id("nextbtn"))
+        .await
+        .context("Could not find sign-in button #nextbtn")?;
+    sign_in_btn.click().await?;
+
+    println!("[*] Waiting for login to complete ...");
+    sleep(PAGE_LOAD_WAIT).await;
+
+    // ── 3. Navigate to Zoho People dashboard ──
+    let current_url = driver.current_url().await?.to_string();
+    if !current_url.contains("people.zoho.eu") {
+        println!("[*] Navigating to Zoho People ...");
+        driver.goto(PEOPLE_URL).await?;
+        sleep(PAGE_LOAD_WAIT).await;
+    }
+
+    // Wait for the SPA to fully load — look for the check-in button
+    println!("[*] Waiting for dashboard to load ...");
+    let button = wait_for_element(&driver, By::Id("ZPAtt_check_in_out"), 30).await
+        .context("Could not find check-in/check-out button #ZPAtt_check_in_out")?;
+
+    // ── 4. Read state BEFORE click ──
+    let status_before = get_status(&driver).await;
+    let btn_text_before = button.text().await.unwrap_or_default();
+    let aria_before = button
+        .attr("aria-label")
         .await?
         .unwrap_or_default();
-    println!();
-    println!("[BEFORE] text  = {:?}", text_before);
-    println!("[BEFORE] class = {:?}", class_before);
 
-    // ── 5. Click ──
     println!();
-    println!("[*] Clicking the button ...");
+    println!("[BEFORE] status     = {:?}", status_before);
+    println!("[BEFORE] button     = {:?}", btn_text_before);
+    println!("[BEFORE] aria-label = {:?}", aria_before);
+
+    // ── 5. Click the button ──
+    println!();
+    println!("[*] Clicking '{}' ...", btn_text_before);
     button.click().await?;
     sleep(POST_CLICK_WAIT).await;
 
-    // ── 6. State AFTER click ──
-    // Re-query – the DOM may have changed.
-    let button_after = find_first_match(&driver, &selectors).await;
-    match button_after {
-        Some(btn) => {
-            let text_after = btn.text().await.unwrap_or_default();
-            let class_after = btn.attr("class").await?.unwrap_or_default();
-            println!();
-            println!("[AFTER]  text  = {:?}", text_after);
-            println!("[AFTER]  class = {:?}", class_after);
+    // ── 6. Read state AFTER click ──
+    let status_after = get_status(&driver).await;
+    let btn_after = driver.find(By::Id("ZPAtt_check_in_out")).await;
+    let btn_text_after = match &btn_after {
+        Ok(b) => b.text().await.unwrap_or_default(),
+        Err(_) => "(button gone)".into(),
+    };
+    let aria_after = match &btn_after {
+        Ok(b) => b.attr("aria-label").await.ok().flatten().unwrap_or_default(),
+        Err(_) => String::new(),
+    };
 
-            if text_before != text_after || class_before != class_after {
-                println!();
-                println!("[OK] Button state changed!");
-            } else {
-                println!();
-                println!("[WARN] Button state looks the same – check manually.");
-            }
-        }
-        None => {
-            println!("[WARN] Button disappeared after click (may be normal).");
-        }
+    println!();
+    println!("[AFTER]  status     = {:?}", status_after);
+    println!("[AFTER]  button     = {:?}", btn_text_after);
+    println!("[AFTER]  aria-label = {:?}", aria_after);
+
+    // ── 7. Compare ──
+    println!();
+    if status_before != status_after || btn_text_before != btn_text_after {
+        println!("[OK] State changed: '{}' -> '{}'", btn_text_before, btn_text_after);
+    } else {
+        println!("[WARN] State looks the same — check manually.");
     }
 
-    // Keep the browser open so the user can verify.
+    // Keep browser open for verification.
     println!();
     println!("[*] Done. Press Ctrl+C to exit (browser stays open).");
     tokio::signal::ctrl_c().await?;
@@ -119,18 +135,30 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Try each CSS selector and return the first element found.
-async fn find_first_match(
+/// Read the attendance status text from `#att_status`.
+async fn get_status(driver: &WebDriver) -> String {
+    match driver.find(By::Id("att_status")).await {
+        Ok(el) => el.text().await.unwrap_or_default(),
+        Err(_) => "(not found)".into(),
+    }
+}
+
+/// Poll for an element to appear (useful for SPA transitions).
+async fn wait_for_element(
     driver: &WebDriver,
-    selectors: &[&str],
-) -> Option<WebElement> {
-    for sel in selectors {
-        if let Ok(el) = driver.find(By::Css(*sel)).await {
-            // Make sure the element is displayed / interactable.
+    by: By,
+    timeout_secs: u64,
+) -> Result<WebElement, anyhow::Error> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if let Ok(el) = driver.find(by.clone()).await {
             if el.is_displayed().await.unwrap_or(false) {
-                return Some(el);
+                return Ok(el);
             }
         }
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!("Timed out waiting for element after {}s", timeout_secs);
+        }
+        sleep(Duration::from_millis(500)).await;
     }
-    None
 }
