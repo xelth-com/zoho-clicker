@@ -164,6 +164,30 @@ fn show_warning_popup() {
     info!("(popup not available on this platform)");
 }
 
+/// Start a process with no visible console window (Windows).
+#[cfg(windows)]
+fn start_hidden(exe: &std::path::Path, args: &[&str]) -> Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    Command::new(exe)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .context("Failed to spawn process")
+}
+
+#[cfg(not(windows))]
+fn start_hidden(exe: &std::path::Path, args: &[&str]) -> Result<std::process::Child> {
+    Command::new(exe)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn process")
+}
+
 /// Detect installed Chrome version via PowerShell.
 fn get_chrome_version() -> Option<String> {
     let paths = [
@@ -351,12 +375,7 @@ async fn ensure_chromedriver() {
     }
 
     if driver_path.exists() {
-        match Command::new(&driver_path)
-            .arg("--port=9515")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
+        match start_hidden(&driver_path, &["--port=9515", "--silent", "--log-level=OFF"]) {
             Ok(_) => info!("Started chromedriver from {}", driver_path.display()),
             Err(e) => error!("Failed to start chromedriver: {}", e),
         }
@@ -376,6 +395,8 @@ async fn zoho_action(config: &Config, action: Action) -> Result<bool> {
     caps.add_arg(&format!("--user-data-dir={}", profile_dir.display()))?;
     caps.add_arg("--window-size=1280,900")?;
     caps.add_arg("--window-position=-2000,0")?; // off-screen
+    caps.add_arg("--disable-logging")?;
+    caps.add_arg("--log-level=3")?; // suppress Chrome console output
     caps.add_exclude_switch("enable-automation")?;
 
     // Ensure chromedriver is running before every action (it may have died)
