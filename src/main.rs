@@ -16,7 +16,6 @@ const DEFAULT_CHECKIN_START: &str = "08:50";
 const DEFAULT_CHECKIN_END: &str = "10:00";
 const DEFAULT_CHECKOUT_AFTER: &str = "18:00";
 
-const LOGIN_URL: &str = "https://accounts.zoho.eu/signin?servicename=zohopeople";
 const PEOPLE_URL: &str =
     "https://people.zoho.eu/20086748177/zp#home/myspace/overview-actionlist";
 
@@ -225,6 +224,10 @@ async fn zoho_action(config: &Config, action: Action) -> Result<bool> {
     caps.add_arg("--window-position=-2000,0")?; // off-screen
     caps.add_exclude_switch("enable-automation")?;
 
+    // Ensure chromedriver is running before every action (it may have died)
+    ensure_chromedriver();
+    sleep(Duration::from_secs(2)).await;
+
     info!("Connecting to ChromeDriver ...");
     let driver = WebDriver::new("http://localhost:9515", caps)
         .await
@@ -247,41 +250,46 @@ async fn do_zoho_action(
         Action::CheckOut => "Check-out",
     };
 
-    // ── Login ──
-    info!("Navigating to Zoho login ...");
-    driver.goto(LOGIN_URL).await?;
+    // ── Try navigating directly to People (may already be logged in) ──
+    info!("Navigating to Zoho People ...");
+    driver.goto(PEOPLE_URL).await?;
     sleep(PAGE_LOAD_WAIT).await;
 
-    // Email
-    info!("Entering email ...");
-    let email_input = driver
-        .find(By::Id("login_id"))
-        .await
-        .context("Could not find #login_id")?;
-    email_input.clear().await?;
-    email_input.send_keys(&config.email).await?;
-
-    driver.find(By::Id("nextbtn")).await?.click().await?;
-    sleep(SHORT_WAIT).await;
-
-    // Password
-    info!("Entering password ...");
-    let pass_input = wait_for_element(driver, By::Id("password"), 15).await
-        .context("Could not find #password")?;
-    pass_input.clear().await?;
-    pass_input.send_keys(&config.password).await?;
-
-    driver.find(By::Id("nextbtn")).await?.click().await?;
-
-    info!("Waiting for login ...");
-    sleep(PAGE_LOAD_WAIT).await;
-
-    // ── Navigate to People ──
+    // Check if we landed on login page (redirected because not authenticated)
     let url = driver.current_url().await?.to_string();
-    if !url.contains("people.zoho.eu") {
-        info!("Redirecting to Zoho People ...");
-        driver.goto(PEOPLE_URL).await?;
+    if url.contains("accounts.zoho.eu") {
+        info!("Not logged in, performing login ...");
+
+        // Email — wait for the field to appear
+        let email_input = wait_for_element(driver, By::Id("login_id"), 15).await
+            .context("Could not find #login_id on login page")?;
+        email_input.clear().await?;
+        email_input.send_keys(&config.email).await?;
+
+        driver.find(By::Id("nextbtn")).await?.click().await?;
+        sleep(SHORT_WAIT).await;
+
+        // Password
+        info!("Entering password ...");
+        let pass_input = wait_for_element(driver, By::Id("password"), 15).await
+            .context("Could not find #password")?;
+        pass_input.clear().await?;
+        pass_input.send_keys(&config.password).await?;
+
+        driver.find(By::Id("nextbtn")).await?.click().await?;
+
+        info!("Waiting for login ...");
         sleep(PAGE_LOAD_WAIT).await;
+
+        // After login, navigate to People if not there yet
+        let url2 = driver.current_url().await?.to_string();
+        if !url2.contains("people.zoho.eu") {
+            info!("Navigating to Zoho People after login ...");
+            driver.goto(PEOPLE_URL).await?;
+            sleep(PAGE_LOAD_WAIT).await;
+        }
+    } else {
+        info!("Already logged in (url: {})", url);
     }
 
     // ── Find button ──
