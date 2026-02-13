@@ -6,7 +6,7 @@ use chrono::{Datelike, Local, NaiveTime, Weekday};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::Duration;
 use thirtyfour::prelude::*;
 use tokio::time::sleep;
@@ -164,50 +164,204 @@ fn show_warning_popup() {
     info!("(popup not available on this platform)");
 }
 
-/// Start chromedriver.exe if not already running.
-fn ensure_chromedriver() -> Option<Child> {
-    if std::net::TcpStream::connect("127.0.0.1:9515").is_ok() {
-        info!("ChromeDriver already running on port 9515");
-        return None;
+/// Detect installed Chrome version via PowerShell.
+fn get_chrome_version() -> Option<String> {
+    let paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ];
+    for path in &paths {
+        let output = Command::new("powershell")
+            .args(["-Command", &format!(
+                "(Get-Item '{}').VersionInfo.FileVersion", path
+            )])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !ver.is_empty() && ver.contains('.') {
+                return Some(ver);
+            }
+        }
+    }
+    None
+}
+
+/// Get chromedriver version by running `chromedriver --version`.
+fn get_chromedriver_version(driver_path: &std::path::Path) -> Option<String> {
+    let output = Command::new(driver_path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    // Output: "ChromeDriver 144.0.7559.133 (abc123...)"
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace().nth(1).map(|s| s.to_string())
+}
+
+/// Extract major.minor.build from a full version string (drop patch).
+fn version_prefix(ver: &str) -> String {
+    let parts: Vec<&str> = ver.split('.').collect();
+    if parts.len() >= 3 {
+        format!("{}.{}.{}", parts[0], parts[1], parts[2])
+    } else {
+        ver.to_string()
+    }
+}
+
+/// Download chromedriver matching the given Chrome version.
+async fn download_chromedriver(chrome_version: &str, dest: &std::path::Path) -> Result<()> {
+    let url = format!(
+        "https://storage.googleapis.com/chrome-for-testing-public/{}/win64/chromedriver-win64.zip",
+        chrome_version
+    );
+    info!("Downloading chromedriver {} ...", chrome_version);
+    info!("URL: {}", url);
+
+    let resp = reqwest::get(&url).await
+        .context("Failed to download chromedriver")?;
+
+    if !resp.status().is_success() {
+        // Try with just major.minor.build.0 if exact version fails
+        let prefix = version_prefix(chrome_version);
+        let fallback_url = format!(
+            "https://storage.googleapis.com/chrome-for-testing-public/{}.0/win64/chromedriver-win64.zip",
+            prefix
+        );
+        info!("Exact version not found, trying {} ...", fallback_url);
+        let resp2 = reqwest::get(&fallback_url).await
+            .context("Failed to download chromedriver (fallback)")?;
+        if !resp2.status().is_success() {
+            anyhow::bail!(
+                "ChromeDriver download failed: HTTP {} for both {} and {}",
+                resp2.status(), url, fallback_url
+            );
+        }
+        let bytes = resp2.bytes().await?;
+        extract_chromedriver_zip(&bytes, dest)?;
+    } else {
+        let bytes = resp.bytes().await?;
+        extract_chromedriver_zip(&bytes, dest)?;
     }
 
+    Ok(())
+}
+
+/// Extract chromedriver.exe from the downloaded zip using PowerShell.
+fn extract_chromedriver_zip(zip_bytes: &[u8], dest: &std::path::Path) -> Result<()> {
+    let dir = dest.parent().unwrap_or(std::path::Path::new("."));
+    let zip_path = dir.join("_chromedriver_tmp.zip");
+    let extract_dir = dir.join("_chromedriver_tmp");
+
+    // Write zip to disk
+    std::fs::write(&zip_path, zip_bytes)
+        .context("Failed to write chromedriver zip")?;
+
+    // Remove old extract dir if exists
+    let _ = std::fs::remove_dir_all(&extract_dir);
+
+    // Extract using PowerShell
+    let status = Command::new("powershell")
+        .args([
+            "-Command",
+            &format!(
+                "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                zip_path.display(),
+                extract_dir.display()
+            ),
+        ])
+        .status()
+        .context("Failed to run PowerShell Expand-Archive")?;
+
+    if !status.success() {
+        anyhow::bail!("PowerShell Expand-Archive failed");
+    }
+
+    // Move chromedriver.exe to destination
+    let extracted = extract_dir.join("chromedriver-win64").join("chromedriver.exe");
+    if extracted.exists() {
+        // Remove old chromedriver if exists (might be locked)
+        let _ = std::fs::remove_file(dest);
+        std::fs::copy(&extracted, dest)
+            .context("Failed to copy chromedriver.exe")?;
+        info!("Installed chromedriver to {}", dest.display());
+    } else {
+        anyhow::bail!("chromedriver.exe not found in zip at {:?}", extracted);
+    }
+
+    // Cleanup
+    let _ = std::fs::remove_file(&zip_path);
+    let _ = std::fs::remove_dir_all(&extract_dir);
+
+    Ok(())
+}
+
+/// Ensure chromedriver.exe exists, matches Chrome version, and is running.
+async fn ensure_chromedriver() {
     let driver_path = exe_dir().join("chromedriver.exe");
-    if !driver_path.exists() {
-        warn!(
-            "chromedriver.exe not found at {}. Trying PATH...",
-            driver_path.display()
-        );
-        match Command::new("chromedriver")
+
+    // ── Check versions and download if needed ──
+    let chrome_ver = get_chrome_version();
+    match &chrome_ver {
+        Some(cv) => info!("Chrome version: {}", cv),
+        None => warn!("Could not detect Chrome version"),
+    }
+
+    let need_download = if !driver_path.exists() {
+        info!("chromedriver.exe not found, will download");
+        true
+    } else if let (Some(cv), Some(dv)) = (&chrome_ver, &get_chromedriver_version(&driver_path)) {
+        let chrome_prefix = version_prefix(cv);
+        let driver_prefix = version_prefix(dv);
+        if chrome_prefix != driver_prefix {
+            info!(
+                "Version mismatch: Chrome {} vs ChromeDriver {} — will update",
+                cv, dv
+            );
+            // Kill old chromedriver before replacing
+            let _ = Command::new("taskkill")
+                .args(["/F", "/IM", "chromedriver.exe"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            sleep(Duration::from_secs(1)).await;
+            true
+        } else {
+            info!("ChromeDriver version {} matches Chrome", dv);
+            false
+        }
+    } else {
+        false
+    };
+
+    if need_download {
+        if let Some(cv) = &chrome_ver {
+            match download_chromedriver(cv, &driver_path).await {
+                Ok(()) => info!("ChromeDriver updated successfully"),
+                Err(e) => error!("Failed to download ChromeDriver: {:#}", e),
+            }
+        } else {
+            error!("Cannot download ChromeDriver: unknown Chrome version");
+        }
+    }
+
+    // ── Start chromedriver if not running ──
+    if std::net::TcpStream::connect("127.0.0.1:9515").is_ok() {
+        info!("ChromeDriver already running on port 9515");
+        return;
+    }
+
+    if driver_path.exists() {
+        match Command::new(&driver_path)
             .arg("--port=9515")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            Ok(child) => {
-                info!("Started chromedriver from PATH");
-                return Some(child);
-            }
-            Err(_) => {
-                error!("Could not find or start chromedriver.exe");
-                return None;
-            }
+            Ok(_) => info!("Started chromedriver from {}", driver_path.display()),
+            Err(e) => error!("Failed to start chromedriver: {}", e),
         }
-    }
-
-    match Command::new(&driver_path)
-        .arg("--port=9515")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => {
-            info!("Started chromedriver from {}", driver_path.display());
-            Some(child)
-        }
-        Err(e) => {
-            error!("Failed to start chromedriver: {}", e);
-            None
-        }
+    } else {
+        error!("chromedriver.exe not found and could not be downloaded");
     }
 }
 
@@ -225,7 +379,7 @@ async fn zoho_action(config: &Config, action: Action) -> Result<bool> {
     caps.add_exclude_switch("enable-automation")?;
 
     // Ensure chromedriver is running before every action (it may have died)
-    ensure_chromedriver();
+    ensure_chromedriver().await;
     sleep(Duration::from_secs(2)).await;
 
     info!("Connecting to ChromeDriver ...");
@@ -377,8 +531,8 @@ async fn main() -> Result<()> {
         config.checkin_start, config.checkin_end, config.checkout_after
     );
 
-    // Start chromedriver if needed
-    let _chromedriver_child = ensure_chromedriver();
+    // Check Chrome/ChromeDriver versions and start chromedriver
+    ensure_chromedriver().await;
     sleep(Duration::from_secs(2)).await;
 
     loop {
